@@ -1,0 +1,215 @@
+# -*- coding: utf-8 -*-
+
+'''
+This Source Code Form is subject to the terms of the Mozilla
+Public License, v. 2.0. If a copy of the MPL was not distributed
+with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+'''
+import utils
+import os
+import shutil
+import codecs
+import detectinfo
+import compile_lib_core
+import compile_lib_gdi
+import compile_lib_osutil
+import compile_lib_screencapture
+import compile_lib_screencapture_bitblt
+import compile_lib_screencapture_xorg
+import compile_lib_screencapture_quartzdisplay
+import compile_lib_screencapture_kit
+import compile_lib_screencapture_desktopduplication
+import compile_lib_soundcapture
+import compile_os_win_launcher
+import compile_os_win_service
+import compile_os_win_updater
+import compile_generic
+
+
+class CompileAll():
+    
+    def __init__(self):
+        self._arch=None
+        self._onlydeps=False
+    
+    def set_arch(self, v):
+        self._arch=v
+    
+    def set_onlydeps(self, v):
+        self._onlydeps=v
+    
+    def get_path_tmp(self):
+        if self._arch is not None:
+            return utils.PATHTMP+"_"+self._arch
+        else:
+            return utils.PATHTMP
+    
+    def get_path_native(self):
+        if self._arch is not None:
+            return utils.PATHNATIVE+"_"+self._arch
+        else:
+            return utils.PATHNATIVE
+    
+    def run(self):
+        bok=True        
+        arstatus=[]
+        utils.init_path(self.get_path_native())
+        utils.info("BEGIN DEPENDENCIES")
+        try:
+            prpfiles = utils.download_prop(utils.get_site_url() + "getAgentConfig.dw?id=latest")
+            if utils.is_windows():
+                self._dependency(prpfiles,"lib_gcc", "8.1.0", arstatus)
+                self._dependency(prpfiles,"lib_stdcpp", "8.1.0", arstatus)
+            self._dependency(prpfiles,"lib_z", "1.2.11", arstatus)
+            self._dependency(prpfiles,"lib_turbojpeg", "2.1.1", arstatus)
+            self._dependency(prpfiles,"lib_opus", "21.3.1", arstatus)
+            self._dependency(prpfiles,"lib_rtaudio", "5.1.0", arstatus)
+            utils.info("END DEPENDENCIES")
+        except:
+            bok=False
+            utils.info("ERROR DEPENDENCIES")
+        
+        if not self._onlydeps and bok:
+            utils.info("BEGIN COMPILE ALL")
+            try:
+                self._compile(compile_lib_core,arstatus)
+                self._compile(compile_lib_gdi,arstatus)
+                self._compile(compile_lib_osutil,arstatus)
+                if utils.is_windows():
+                    self._compile(compile_os_win_launcher,arstatus)
+                    self._compile(compile_os_win_service,arstatus)
+                    self._compile(compile_os_win_updater,arstatus)
+                self._compile(compile_lib_screencapture,arstatus)
+                if utils.is_windows():
+                    self._compile(compile_lib_screencapture_bitblt,arstatus)
+                    self._compile(compile_lib_screencapture_desktopduplication,arstatus)
+                if utils.is_linux():
+                    self._compile(compile_lib_screencapture_xorg,arstatus)
+                if utils.is_mac():
+                    self._compile(compile_lib_screencapture_quartzdisplay,arstatus)
+                    #self._compile(compile_lib_screencapture_kit,arstatus)
+                self._compile(compile_lib_soundcapture,arstatus)
+                utils.info("END COMPILE ALL")
+            except:
+                bok=False
+                utils.info("ERROR COMPILE ALL")
+        
+         
+        utils.info("")
+        utils.info("")
+        utils.info("STATUS:")
+        for n in arstatus:
+            utils.info(n)
+        utils.info("")
+        if bok:
+            utils.info("ALL COMPILED CORRECTLY.")
+        else:
+            utils.info("ERRORS OCCURRED.")
+        
+    
+    def _compile(self,md,ars):
+        mcp = md.Compile()
+        smsg=mcp.get_name()
+        try:
+            if self._arch is not None:
+                mcp.set_arch(self._arch)
+                  
+            mcp.run()
+            smsg+=" - OK!"
+            ars.append(smsg)
+        except Exception as e:
+            smsg+=" - ERROR: " + utils.exception_to_string(e)
+            ars.append(smsg)
+            raise e
+    
+    def _dependency_post_fix(self,snm,sver):
+        spth=self.get_path_tmp() + os.sep + snm;
+        if snm=="lib_z":
+            if utils.is_mac():   
+                #CORREGGE zutil.h
+                apppth=spth + os.sep + "zutil.h"
+                f = codecs.open(apppth, encoding='utf-8')
+                appdata = f.read()
+                f.close()
+                appdata=appdata.replace('#  define local static','//#  define local static')
+                os.remove(apppth)
+                f = codecs.open(apppth, encoding='utf-8', mode='w+')
+                f.write(appdata)
+                f.close()
+    
+    def _dependency(self,prpfiles,snm,sver,ars):        
+        spth=self.get_path_tmp() + os.sep + snm;
+        smsg = snm + " " + sver
+        utils.info("BEGIN " + snm)        
+        try:
+            conf = utils.read_json_file(spth + os.sep + snm + ".json")
+            bupd=True; 
+            if conf is not None:
+                if "version" in conf:
+                    if conf["version"]==sver:
+                        bupd=False
+                    else:
+                        utils.info("incorrect version.")
+                else:
+                    utils.info("version not found.")
+            else:
+                utils.info("version not found.")
+            if bupd:
+                sfx = detectinfo.get_native_suffix()
+                if sfx is None or "generic" in sfx:
+                    utils.info("os not detected.")
+                    raise Exception("You have to compile it manually.")
+                if self._arch==compile_generic.ARCH_X86_64:
+                    sfx=sfx.replace("arm64_v1","x86_64")
+                elif self._arch==compile_generic.ARCH_X86_32:
+                    sfx=sfx.replace("64","32")
+                utils.init_path(spth)
+                utils.info("download headers and library ...")
+                if snm!="lib_gcc" and snm!="lib_stdcpp":
+                    appnm="headers_" + snm + ".zip"                    
+                    fitm=prpfiles["files"]["agent/headers/" + snm + ".zip"]                    
+                    utils.download_file(utils.get_site_url() + "app/" + fitm["file"] , spth + os.sep + appnm)                    
+                    utils.unzip_file(spth + os.sep + appnm, spth + os.sep)
+                    utils.remove_file(spth + os.sep + appnm)
+                
+                appnm=snm + "_" + sfx + ".zip"
+                fitm=prpfiles["files"]["agent/" + sfx + "/" + snm + ".zip"]
+                utils.download_file(utils.get_site_url() + "app/" + fitm["file"] , spth + os.sep + appnm)
+                utils.unzip_file(spth + os.sep + appnm, spth + os.sep, "native/")
+                utils.remove_file(spth + os.sep + appnm)
+                #FIX Version
+                conf = utils.read_json_file(spth + os.sep + snm + ".json")
+                if conf is not None:
+                    if "version" not in conf:
+                        conf["version"]=sver
+                        utils.write_json_file(conf, spth + os.sep + snm + ".json")
+            
+            #COPY LIB TO NATIVE
+            for f in os.listdir(spth):
+                if f.endswith('.dll') or f.endswith('.so') or f.endswith('.dylib'): 
+                    shutil.copy2(spth + os.sep + f, self.get_path_native() + os.sep + f)
+            
+            #POST FIX
+            self._dependency_post_fix(snm,sver)
+            
+            smsg+=" - OK!"
+            ars.append(smsg)
+            utils.info("END " + snm)
+        except Exception as e:
+            smsg+=" - ERROR: " + utils.exception_to_string(e)
+            ars.append(smsg)
+            raise e
+        
+if __name__ == "__main__":
+    m = CompileAll()
+    #m.set_arch(compile_generic.ARCH_X86_64)
+    #m.set_arch(compile_generic.ARCH_X86_32)
+    #m.set_onlydeps(True)
+    m.run()
+    
+    
+    
+    
+    
+    
+    

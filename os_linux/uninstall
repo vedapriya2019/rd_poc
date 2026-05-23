@@ -1,0 +1,32 @@
+#!/bin/sh
+#This Source Code Form is subject to the terms of the Mozilla
+#Public License, v. 2.0. If a copy of the MPL was not distributed
+#with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+PATH_DWA="@PATH_DWA@"
+PATH_DWA_RUNTIME="$PATH_DWA/runtime/bin"
+PATH_DWA_RUNTIME_LIBRARY="$PATH_DWA/runtime/lib"
+PATH_DWA_NATIVE="$PATH_DWA/native"
+
+if [ "$(id -u)" != "0" ]; then
+	echo "You must have root privileges to run this installer. Please try again, this time running the script using the root user." 
+	exit 1
+else
+	cd "${PATH_DWA}"
+	export LD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+	export PYTHONIOENCODING=utf-8
+	"${PATH_DWA_RUNTIME}/@EXE_NAME@" installer.py uninstall $@
+	if [ ! $? -eq 0 ]; then
+		echo "Error starting gui, attempt to start console mode..."
+		"${PATH_DWA_RUNTIME}/@EXE_NAME@" installer.py uninstall -console
+	fi
+	if [ -f "${PATH_DWA}/agent.uninstall" ]; then
+		cd /tmp
+		echo '#!/bin/sh' > @EXE_NAME@_remove
+		echo 'sleep 2' >> @EXE_NAME@_remove
+		echo 'rm -r -f "@PATH_DWA@"' >> @EXE_NAME@_remove
+		chmod u+x @EXE_NAME@_remove
+		./@EXE_NAME@_remove &
+	fi
+fi
+exit 0

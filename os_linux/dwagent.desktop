@@ -1,0 +1,10 @@
+[Desktop Entry]
+Encoding=UTF-8
+Version=1.0
+Terminal=false
+Icon=@PATH_LOGOOS@
+Exec="@PATH_DWA@/native/@EXE_NAME@"
+Categories=System;Application;
+Type=Application
+Name=@NAME@
+GenericName=@NAME@

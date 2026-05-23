@@ -1,0 +1,40 @@
+#!/bin/sh
+#This Source Code Form is subject to the terms of the Mozilla
+#Public License, v. 2.0. If a copy of the MPL was not distributed
+#with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+PATH_DWA="@PATH_DWA@"
+PATH_DWA_NATIVE="$PATH_DWA/native"
+PATH_DWA_RUNTIME="$PATH_DWA/runtime/bin"
+PATH_DWA_RUNTIME_LIBRARY="$PATH_DWA/runtime/lib"
+
+if [ "$1" == "uninstall" ]; then
+	if [ "$(id -u)" == "0" ]; then
+		cd "${PATH_DWA}"
+		export DYLD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+		if [ -z "$2" ]; then
+			"${PATH_DWA_RUNTIME}/@EXE_NAME@" installer.py uninstall
+		else
+			"${PATH_DWA_RUNTIME}/@EXE_NAME@" installer.py uninstall LANG=$2
+		fi	
+		if [ -f "${PATH_DWA}/agent.uninstall" ]; then
+			cd /tmp
+			echo '#!/bin/sh' > dwagent_remove
+			echo 'sleep 2' >> dwagent_remove
+			echo 'rm -r -f "@PATH_DWA@"' >> dwagent_remove
+			chmod u+x dwagent_remove
+			./dwagent_remove &
+		fi	
+	else
+		exit 1
+	fi
+elif [ "$1" == "configure" ]; then
+	cd "${PATH_DWA}"
+	export DYLD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+	"${PATH_DWA_RUNTIME}/@EXE_NAME@" configure.py
+elif [ "$1" == "monitor" ]; then
+	cd "${PATH_DWA}"
+	export DYLD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+	"${PATH_DWA_RUNTIME}/@EXE_NAME@" monitor.py
+fi
+exit 0

@@ -1,0 +1,621 @@
+#!/bin/sh
+#
+# chkconfig: 2345 80 30
+# description: @NAME@ Service
+#
+### BEGIN INIT INFO
+# Provides: @NAME@
+# Required-Start:
+# Required-Stop:
+# Should-Start:
+# Should-Stop:
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Start and Stop @NAME@ Service
+# Description: @NAME@ Service
+### END INIT INFO
+#This Source Code Form is subject to the terms of the Mozilla
+#Public License, v. 2.0. If a copy of the MPL was not distributed
+#with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+RETVAL=0
+PATH_DWA="@PATH_DWA@"
+PATH_DWA_NATIVE="$PATH_DWA/native"
+PATH_DWA_RUNTIME="$PATH_DWA/runtime/bin"
+PATH_DWA_RUNTIME_LIBRARY="$PATH_DWA/runtime/lib"
+TIMEOUT_START_STOP=30
+INST_VER=0
+if [ -f "${PATH_DWA_NATIVE}/installer.ver" ]; then
+	INST_VER=$(cat "${PATH_DWA_NATIVE}/installer.ver")
+fi
+
+install_systemctl(){
+	if [ ! -f /etc/systemd/system/@EXE_NAME@.service ]; then
+		cp "${PATH_DWA_NATIVE}/@EXE_NAME@.service" /etc/systemd/system/@EXE_NAME@.service
+		if [ $? -eq 0 ]; then
+			systemctl --system daemon-reload
+			systemctl enable @EXE_NAME@.service
+			if [ $? -eq 0 ]; then
+				echo "systemctl" > "${PATH_DWA_NATIVE}/service.mng"
+				echo "Installed"
+			else
+				echo "Error: Enable systemctl."
+				RETVAL=11
+			fi
+		else
+			echo "Error: Copy file service in systemd."
+			RETVAL=12
+		fi
+	else
+		echo "Error: Service already installed."
+		RETVAL=1
+	fi
+}
+
+install_chkconfig(){
+	if [ ! -f /etc/init.d/@EXE_NAME@ ]; then
+		ln -s "${PATH_DWA_NATIVE}/dwagsvc" /etc/init.d/@EXE_NAME@
+		if [ $? -eq 0 ]; then
+			chkconfig --add @EXE_NAME@
+			if [ $? -eq 0 ]; then
+				echo "chkconfig" > "${PATH_DWA_NATIVE}/service.mng"
+				echo "Installed"
+			else
+				echo "Error: Add chkconfig."
+				RETVAL=11
+			fi
+		else
+			echo "Error: Create symbolic link."
+			RETVAL=12
+		fi
+	else
+		echo "Error: Service already installed."
+		RETVAL=1
+	fi
+}
+
+install_updatercd(){
+	if [ ! -f /etc/init.d/@EXE_NAME@ ]; then
+		ln -s "${PATH_DWA_NATIVE}/dwagsvc" /etc/init.d/@EXE_NAME@
+		if [ $? -eq 0 ]; then
+			#update-rc.d -f @EXE_NAME@ start 80 2 3 4 5 . stop 30 0 1 6 .
+			update-rc.d -f @EXE_NAME@ defaults
+			if [ $? -eq 0 ]; then
+				echo "updatercd" > "${PATH_DWA_NATIVE}/service.mng"
+				echo "Installed"
+			else
+				echo "Error: Add update-rc.d."
+				RETVAL=11
+			fi
+		else
+			echo "Error: Create symbolic link."
+			RETVAL=12
+		fi
+	else
+		echo "Error: Service already installed."
+		RETVAL=1
+	fi
+}
+
+install_openrc(){
+	if [ ! -f /etc/init.d/@EXE_NAME@ ]; then
+		cp "${PATH_DWA_NATIVE}/dwagent.openrc" /etc/init.d/@EXE_NAME@
+		if [ $? -eq 0 ]; then
+			rc-update add @EXE_NAME@
+			if [ $? -eq 0 ]; then
+				echo "openrc" > "${PATH_DWA_NATIVE}/service.mng"
+				echo "Installed"
+			else
+				echo "Error: Add rc-update."
+				RETVAL=11
+			fi
+		else
+			echo "Error: Create symbolic link."
+			RETVAL=12
+		fi
+	else
+		echo "Error: Service already installed."
+		RETVAL=1
+	fi
+}
+
+install_rclocal(){
+	if [ ! -f /etc/rc.d/rc.@EXE_NAME@ ]; then
+		ln -s "${PATH_DWA_NATIVE}/dwagsvc" /etc/rc.d/rc.@EXE_NAME@
+        if [ -f /etc/rc.d/rc.local ]; then
+			sed -i '/\/etc\/rc.d\/rc.@EXE_NAME@ start/d' /etc/rc.d/rc.local
+        fi
+        echo "/etc/rc.d/rc.@EXE_NAME@ start" >> /etc/rc.d/rc.local
+        if [ -f /etc/rc.d/rc.local_shutdown ]; then
+        	sed -i '/\/etc\/rc.d\/rc.@EXE_NAME@ stop/d' /etc/rc.d/rc.local_shutdown
+        fi
+        echo "/etc/rc.d/rc.@EXE_NAME@ stop" >> /etc/rc.d/rc.local_shutdown
+        chmod +x /etc/rc.d/rc.local_shutdown
+        echo "rclocal" > "${PATH_DWA_NATIVE}/service.mng"
+        echo "Installed"
+	else
+		echo "Error: Service already installed."
+		RETVAL=1
+	fi   
+}
+
+install(){
+	if [ "$(which "systemctl" 2>/dev/null)" ] && [ "$(systemctl list-units -t service 2>/dev/null)" ]; then
+    	install_systemctl
+    elif [ "$(which "chkconfig" 2>/dev/null)" ]; then
+    	install_chkconfig
+	elif [ "$(which "update-rc.d" 2>/dev/null)" ]; then
+        install_updatercd
+	elif [ "$(which "rc-update" 2>/dev/null)" ]; then
+        install_openrc
+    elif [ -f /etc/rc.d/rc.local ]; then
+    	install_rclocal
+	else
+		echo "Error: Missing systemctl or chkconfig or update-rc.d command."
+		RETVAL=2
+	fi
+}
+
+delete_systemctl(){
+	if [ -f /etc/systemd/system/@EXE_NAME@.service ]; then
+		systemctl disable @EXE_NAME@.service
+		if [ $? -eq 0 ]; then
+			rm /etc/systemd/system/@EXE_NAME@.service
+			if [ $? -eq 0 ]; then
+				systemctl --system daemon-reload
+				if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+					rm "${PATH_DWA_NATIVE}/service.mng"
+				fi
+				echo "Deleted"
+			else
+				echo "Error: Remove service file."
+				RETVAL=11
+			fi
+		else
+			echo "Error: Disable service in systemd."
+			RETVAL=12
+		fi
+	else
+		echo "Error: Service not installed."
+		RETVAL=1
+	fi
+}
+
+delete_chkconfig(){
+	if [ -f /etc/init.d/@EXE_NAME@ ]; then
+		chkconfig --del @EXE_NAME@
+		if [ $? -eq 0 ]; then
+			rm /etc/init.d/@EXE_NAME@
+			if [ $? -eq 0 ]; then
+				if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+					rm "${PATH_DWA_NATIVE}/service.mng"
+				fi
+				echo "Deleted"
+			else
+				echo "Error: Remove symbolic link."
+				RETVAL=12
+			fi
+		else
+			echo "Error: Del chkconfig."
+			RETVAL=11
+		fi
+	else
+		chkconfig --del @EXE_NAME@ &>/dev/null
+		echo "Error: Service not installed."
+		RETVAL=1
+	fi
+}
+
+delete_updatercd(){
+	if [ -f /etc/init.d/@EXE_NAME@ ]; then
+		update-rc.d -f @EXE_NAME@ remove
+		if [ $? -eq 0 ]; then
+			rm /etc/init.d/@EXE_NAME@
+			if [ $? -eq 0 ]; then
+				if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+					rm "${PATH_DWA_NATIVE}/service.mng"
+				fi
+				echo "Deleted"
+			else
+				echo "Error: Remove symbolic link."
+				RETVAL=12
+			fi
+		else
+			echo "Error: Del update-rc.d."
+			RETVAL=11
+		fi
+	else
+		update-rc.d -f @EXE_NAME@ remove > /dev/null 2>&1
+		echo "Error: Service not installed."
+		RETVAL=1
+	fi
+}
+
+delete_openrc(){
+	if [ -f /etc/init.d/@EXE_NAME@ ]; then
+		rc-update del @EXE_NAME@
+		if [ $? -eq 0 ]; then
+			rm /etc/init.d/@EXE_NAME@
+			if [ $? -eq 0 ]; then
+				if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+					rm "${PATH_DWA_NATIVE}/service.mng"
+				fi
+				echo "Deleted"
+			else
+				echo "Error: Remove symbolic link."
+				RETVAL=12
+			fi
+		else
+			echo "Error: Del rc-update."
+			RETVAL=11
+		fi
+	else
+		rc-update del @EXE_NAME@ > /dev/null 2>&1
+		echo "Error: Service not installed."
+		RETVAL=1
+	fi
+}
+
+delete_rclocal(){
+	if [ -f /etc/rc.d/rc.@EXE_NAME@ ]; then
+    	if [ -f /etc/rc.d/rc.local ]; then
+			sed -i '/\/etc\/rc.d\/rc.@EXE_NAME@ start/d' /etc/rc.d/rc.local
+        fi
+        if [ -f /etc/rc.d/rc.local_shutdown ]; then
+        	sed -i '/\/etc\/rc.d\/rc.@EXE_NAME@ stop/d' /etc/rc.d/rc.local_shutdown
+        fi
+        rm /etc/rc.d/rc.@EXE_NAME@
+        if [ $? -eq 0 ]; then
+			if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+				rm "${PATH_DWA_NATIVE}/service.mng"
+            fi
+        	echo "Deleted"
+        else
+        	echo "Error: Remove symbolic link."
+        	RETVAL=12
+        fi
+    else			
+		echo "Error: Service not installed."
+		RETVAL=1
+	fi
+}
+
+delete(){
+	if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+		if [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "systemctl" ]; then
+			delete_systemctl
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "chkconfig" ]; then
+			delete_chkconfig
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "updatercd" ]; then
+			delete_updatercd
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "openrc" ]; then
+			delete_openrc
+        elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "rclocal" ]; then
+			delete_rclocal
+		fi				
+	else
+		if [ "$(which "systemctl" 2>/dev/null)" ] && [ "$(systemctl list-units -t service 2>/dev/null)" ]; then
+			delete_systemctl
+		elif [ "$(which "chkconfig" 2>/dev/null)" ]; then
+			delete_chkconfig
+		elif [ "$(which "update-rc.d" 2>/dev/null)" ]; then
+			delete_updatercd
+		elif [ "$(which "rc-update" 2>/dev/null)" ]; then
+			delete_openrc
+        elif [ -f /etc/rc.d/rc.local ]; then
+        	delete_rclocal
+		else
+			echo "Error: Missing chkconfig or update-rc.d command."
+			RETVAL=2
+		fi
+	fi
+}
+
+rem_file() {
+	if [ -f $1 ]; then
+		rm -f $1
+	fi
+}
+
+test_pid() {
+	if [ -f dwagent.pid ]; then
+		PIDDW=`cat dwagent.pid`
+		kill -0 $PIDDW > /dev/null 2>&1
+		if test $? -eq 0; then
+			cmdtest=$(cat "/proc/$PIDDW/comm")
+			cmdexpected=$(cat "/proc/$$/comm")
+        	if [ "$cmdtest" = "$cmdexpected" ]; then
+        		return 1
+        	else
+        		echo "Warning: @NAME@ is not running, but pid file exists "
+				rem_file dwagent.pid
+        	fi			
+		else
+			echo "Warning: @NAME@ is not running, but pid file exists "
+			rem_file dwagent.pid
+		fi
+	fi
+	return 0
+}
+
+run() {
+	cd "${PATH_DWA}"
+	test_pid
+	if [ $? -eq 0 ]; then
+		echo $$ > dwagent.pid
+		while [ ! -f dwagent.stop ]
+		do
+			. "${PATH_DWA_NATIVE}/dwagupd"
+			if check_update "${PATH_DWA}" "@EXE_NAME@"; then
+				cd "${PATH_DWA}"
+				export LD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+				export PYTHONIOENCODING=utf-8
+				"${PATH_DWA_RUNTIME}/@EXE_NAME@" agent.py -filelog
+			fi
+			for X in $(seq 5)
+			do
+				if [ ! -f dwagent.stop ]; then
+					sleep 1
+				fi
+			done
+		done
+		rem_file dwagent.stop
+		rem_file dwagent.pid
+	else
+		echo "Error: @NAME@ already run."
+	fi
+}
+
+start_internal() {
+	cd "${PATH_DWA}"
+	test_pid
+	if [ $? -eq 0 ]; then
+		echo "Starting @NAME@ daemon"
+		rem_file dwagent.stop
+		rem_file dwagent.start
+		export LD_LIBRARY_PATH=${PATH_DWA_RUNTIME_LIBRARY}
+		export PYTHONIOENCODING=utf-8
+		"${PATH_DWA_RUNTIME}/@EXE_NAME@" "${PATH_DWA}/daemon.py" "${PATH_DWA_NATIVE}/dwagsvc" run  > "${PATH_DWA_NATIVE}/service.log" 2>&1
+		c=0
+		while [ ! -f dwagent.start ]
+		do
+			sleep 1
+			c=`expr $c + 1`
+			if [ $c -ge $TIMEOUT_START_STOP ]; then
+				echo "Warning: Starting timeout."
+				RETVAL=11
+				break
+			fi
+		done
+		rem_file dwagent.start
+	else
+		echo "@NAME@ already stared."
+		RETVAL=1
+	fi
+}
+
+start() {
+	if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+		if [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "systemctl" ]; then
+			if ! systemctl start @EXE_NAME@.service; then
+				RETVAL=1
+			fi
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "chkconfig" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "updatercd" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "openrc" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		else
+			start_internal
+		fi				
+	else
+		if [ "$(which "systemctl" 2>/dev/null)" ] && [ "$(systemctl list-units -t service 2>/dev/null)" ]; then
+			if ! systemctl start @EXE_NAME@.service; then
+				RETVAL=1
+			fi
+		elif [ "$(which "chkconfig" 2>/dev/null)" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		elif [ "$(which "update-rc.d" 2>/dev/null)" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		elif [ "$(which "rc-update" 2>/dev/null)" ]; then
+			if [ "$(which "start-stop-daemon" 2>/dev/null)" ]; then
+				if ! start-stop-daemon --start --quiet --oknodo --exec "${PATH_DWA_NATIVE}/dwagsvc" -- start_internal; then
+					RETVAL=1
+				fi
+			else
+				start_internal
+			fi
+		else
+			start_internal
+		fi
+	fi
+}
+
+stop_internal() {
+	cd "${PATH_DWA}"
+	test_pid
+	if [ $? -eq 1 ]; then
+		echo "Stopping @NAME@ daemon"
+		echo "" > dwagent.stop
+		c=0
+		while [ -f dwagent.stop ]
+		do
+			sleep 1
+			c=`expr $c + 1`
+			if [ $c -ge $TIMEOUT_START_STOP ]; then
+				echo "Warning: Stopping timeout."
+				PIDDW=`cat dwagent.pid`
+				echo "Warning: Kill process $PIDDW."
+				kill -9 $PIDDW
+				break
+			fi
+		done
+	else
+		echo "@NAME@ already stopped."
+		RETVAL=1
+	fi
+}
+
+stop() {
+	if [ -f "${PATH_DWA_NATIVE}/service.mng" ]; then
+		if [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "systemctl" ]; then
+			if ! systemctl stop @EXE_NAME@.service; then
+				RETVAL=1
+			fi
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "chkconfig" ]; then
+			stop_internal
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "updatercd" ]; then
+			stop_internal
+		elif [ "$(cat "${PATH_DWA_NATIVE}/service.mng")" = "openrc" ]; then
+			stop_internal
+		else
+			stop_internal
+		fi				
+	else
+		if [ "$(which "systemctl" 2>/dev/null)" ] && [ "$(systemctl list-units -t service 2>/dev/null)" ]; then
+			if ! systemctl stop @EXE_NAME@.service; then
+				RETVAL=1
+			fi
+		elif [ "$(which "chkconfig" 2>/dev/null)" ]; then
+			stop_internal
+		elif [ "$(which "update-rc.d" 2>/dev/null)" ]; then
+			stop_internal
+		elif [ "$(which "rc-update" 2>/dev/null)" ]; then
+			stop_internal
+		else
+			stop_internal
+		fi
+	fi
+}
+
+restart() {
+	stop
+	start
+}
+
+status() {
+	cd "${PATH_DWA}"
+	test_pid
+	if [ ! $? -eq 1 ]; then
+		echo "Not running."
+		RETVAL=3
+	else
+		echo "Running."
+	fi
+}
+
+install_bin(){
+	ln -s '@PATH_DWA@/native/@EXE_NAME@' $1/@EXE_NAME@_monitor
+	ln -s '@PATH_DWA@/native/configure' $1/@EXE_NAME@_configure
+	ln -s '@PATH_DWA@/native/uninstall' $1/@EXE_NAME@_uninstall
+}
+
+uninstall_bin(){
+	if [ -f $1/@EXE_NAME@_monitor ]; then
+		rm $1/@EXE_NAME@_monitor
+	fi
+	if [ -f $1/@EXE_NAME@_configure ]; then
+		rm $1/@EXE_NAME@_configure
+	fi
+	if [ -f $1/@EXE_NAME@_uninstall ]; then
+		rm $1/@EXE_NAME@_uninstall
+	fi
+}
+
+install_shortcuts(){
+	if [ -d /usr/bin ]; then
+		install_bin /usr/bin
+	elif [ -d /bin ]; then
+		install_bin /bin
+	fi
+	if [ "$(which "xdg-desktop-menu")" ]; then
+		cd "${PATH_DWA_NATIVE}"
+		xdg-desktop-menu install --noupdate --mode system --novendor @EXE_NAME@.desktop
+		xdg-desktop-menu forceupdate
+	else
+		RETVAL=1
+	fi
+}
+
+uninstall_shortcuts(){
+	uninstall_bin /usr/bin
+	uninstall_bin /bin
+	if [ "$(which "xdg-desktop-menu")" ]; then
+		cd "${PATH_DWA_NATIVE}"
+		xdg-desktop-menu uninstall --mode system --novendor @EXE_NAME@.desktop
+	else
+		RETVAL=1
+	fi
+}
+
+case "$1" in
+start)
+  start
+;;
+start_internal)
+  start_internal
+;;
+stop_internal)
+  stop_internal
+;;
+stop)
+  stop
+;;
+restart)
+  restart
+;;
+status)
+  status
+;;
+run)
+  run
+;;
+install)
+  install
+;;
+delete)
+  delete
+;;
+install_shortcuts)
+  install_shortcuts
+;;
+uninstall_shortcuts)
+  uninstall_shortcuts
+;;
+*)
+echo $"Usage: $0 {start|stop|restart}"
+exit 1
+esac
+
+exit $RETVAL

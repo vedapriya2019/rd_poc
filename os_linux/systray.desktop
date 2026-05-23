@@ -1,0 +1,7 @@
+[Desktop Entry]
+Encoding=UTF-8
+Type=Application
+Terminal=false
+Icon=@PATH_LOGOOS@
+Exec="@PATH_DWA@/native/systray"
+Name=@NAME@ - Systray
