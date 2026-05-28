@@ -11,6 +11,7 @@ import socketserver
 import subprocess
 import os
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -80,7 +81,7 @@ def free_listening_port(port, retries=3):
         return False
 
 
-class ReusableTCPServer(socketserver.TCPServer):
+class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
@@ -92,6 +93,44 @@ class ReusableTCPServer(socketserver.TCPServer):
             except OSError:
                 pass
         super().server_bind()
+
+
+def get_lan_addresses():
+    """Return non-loopback IPv4 addresses reachable from the local network."""
+    addresses = []
+    seen = set()
+
+    def add(addr):
+        if not addr or addr.startswith('127.') or addr in seen:
+            return
+        seen.add(addr)
+        addresses.append(addr)
+
+    try:
+        host = socket.gethostname()
+        for info in socket.getaddrinfo(host, None, socket.AF_INET):
+            add(info[4][0])
+    except Exception:
+        pass
+
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(('8.8.8.8', 80))
+        add(probe.getsockname()[0])
+        probe.close()
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=2)
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == 'inet':
+                add(parts[1])
+    except Exception:
+        pass
+
+    return addresses
 
 
 def _load_core_graphics():
@@ -750,6 +789,10 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
     cursor_tracker = None
     capture_bounds = CaptureBounds()
     health_monitor = None
+    screenshot_lock = threading.Lock()
+    screenshot_cache = {}
+    min_capture_interval = 0.075
+    _last_capture_started = 0.0
 
     @classmethod
     def init_cursor_tracker(cls):
@@ -772,6 +815,10 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
             self.serve_desktop_page()
         elif parsed.path == '/api/screenshot':
             self.serve_screenshot()
+        elif parsed.path == '/api/frame.jpg':
+            self.serve_screenshot_jpeg()
+        elif parsed.path == '/api/stream.mjpg':
+            self.serve_mjpeg_stream()
         elif parsed.path == '/api/cursor':
             self.serve_cursor_position()
         elif parsed.path == '/api/status':
@@ -880,7 +927,12 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
             box-shadow: 0 1px 6px rgba(0,0,0,0.55);
         }
         .loading { color: white; font-size: 18px; }
-        .controls { position: fixed; bottom: 20px; right: 20px; background: rgba(52, 73, 94, 0.9); padding: 15px; border-radius: 8px; color: white; }
+        .controls { position: fixed; bottom: 20px; right: 20px; min-width: 230px; background: rgba(34, 49, 63, 0.92); padding: 10px 12px 12px; border-radius: 8px; color: white; box-shadow: 0 10px 30px rgba(0,0,0,0.35); }
+        .controls-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; font-weight: bold; }
+        .controls-toggle { width: 30px; height: 28px; padding: 0; border-radius: 4px; background: #263747; color: white; border: 1px solid rgba(255,255,255,0.2); cursor: pointer; }
+        .controls-toggle:hover { background: #34506a; }
+        .controls.collapsed { min-width: 0; padding: 8px; }
+        .controls.collapsed .controls-title, .controls.collapsed .controls-body { display: none; }
         .controls label { display: block; margin: 5px 0; }
         .cursor-info { position: fixed; top: 60px; right: 20px; background: rgba(52, 73, 94, 0.9); padding: 10px 15px; border-radius: 8px; color: #2ecc71; font-family: monospace; font-size: 12px; display: none; }
     </style>
@@ -891,7 +943,7 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         <span style="font-size: 18px; font-weight: bold;">🖥️ Remote Desktop</span>
         <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
         <button onclick="refreshScreen()">🔄 Refresh</button>
-        <span class="status">FPS: <span id="fps">0</span> | Quality: <span id="quality">High</span> | Cursor: <span id="cursorStatus">●</span></span>
+        <span class="status">FPS: <span id="fps">0</span> | Latency: <span id="latency">0ms</span> | Quality: <span id="quality">High</span> | Cursor: <span id="cursorStatus">●</span> | LAN: <span id="lanStatus">checking</span></span>
     </div>
 
     <div class="desktop-container" id="desktopContainer">
@@ -904,21 +956,28 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
 
     <div class="cursor-info" id="cursorInfo">Cursor: <span id="cursorCoords">0, 0</span> FPS: <span id="cursorFps">60</span></div>
 
-    <div class="controls">
-        <label><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label>
-        <label><input type="checkbox" id="showCursor" checked> Show remote cursor</label>
-        <label><input type="checkbox" id="debugCursor"> Debug cursor</label>
-        <label>Refresh Rate: <select id="refreshRate">
-            <option value="100">10 FPS</option>
-            <option value="200">5 FPS</option>
-            <option value="500" selected>2 FPS</option>
-            <option value="1000">1 FPS</option>
-        </select></label>
-        <label>Quality: <select id="qualitySelect">
-            <option value="high" selected>High</option>
-            <option value="medium">Medium</option>
-            <option value="low">Low</option>
-        </select></label>
+    <div class="controls" id="controlsPanel">
+        <div class="controls-header">
+            <span class="controls-title">View controls</span>
+            <button class="controls-toggle" id="controlsToggle" title="Minimize controls" aria-label="Minimize controls">_</button>
+        </div>
+        <div class="controls-body">
+            <label><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label>
+            <label><input type="checkbox" id="showCursor" checked> Show remote cursor</label>
+            <label><input type="checkbox" id="debugCursor"> Debug cursor</label>
+            <label>Refresh Rate: <select id="refreshRate">
+                <option value="67">15 FPS</option>
+                <option value="100" selected>10 FPS</option>
+                <option value="200">5 FPS</option>
+                <option value="500">2 FPS</option>
+                <option value="1000">1 FPS</option>
+            </select></label>
+            <label>Quality: <select id="qualitySelect">
+                <option value="high" selected>High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+            </select></label>
+        </div>
     </div>
 
     <script>
@@ -932,9 +991,15 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         const cursorCoords = document.getElementById('cursorCoords');
         const cursorFps = document.getElementById('cursorFps');
         const cursorStatus = document.getElementById('cursorStatus');
+        const latencyDisplay = document.getElementById('latency');
+        const lanStatus = document.getElementById('lanStatus');
 
-        let refreshInterval = null;
+        let refreshTimer = null;
         let cursorTrackInterval = null;
+        let refreshInFlight = false;
+        let latestFrameUrl = null;
+        let streamToken = 0;
+        let streamMode = true;
         let frameCount = 0;
         let lastFpsUpdate = Date.now();
         let cursorUpdateCount = 0;
@@ -943,6 +1008,7 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         let lastNormY = null;
         let screenAspect = null;
         let resizeFrameId = null;
+        let adaptiveDelay = 100;
 
         function clamp01(value) {
             return Math.max(0, Math.min(1, value));
@@ -1054,53 +1120,104 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         function refreshScreen() {
-            const timestamp = new Date().getTime();
-            fetch('/api/screenshot?t=' + timestamp)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        loading.style.display = 'block';
-                        loading.textContent = data.hint || data.error;
-                    } else if (data.image) {
-                        const syncAfterLoad = () => {
-                            if (data.capture_width && data.capture_height) {
-                                screenAspect = data.capture_width / data.capture_height;
-                            } else if (screen.naturalWidth && screen.naturalHeight) {
-                                screenAspect = screen.naturalWidth / screen.naturalHeight;
-                            }
-                            screenFrame.style.display = 'block';
-                            syncScreenFrameSize();
-                            trackCursorPosition();
-                        };
+            if (streamMode && document.getElementById('autoRefresh').checked) {
+                startStream();
+                return;
+            }
+            if (refreshInFlight) return;
+            refreshInFlight = true;
+            const started = performance.now();
+            const quality = document.getElementById('qualitySelect').value;
+            const timestamp = Date.now();
 
-                        screen.onload = syncAfterLoad;
-                        screen.src = 'data:image/jpeg;base64,' + data.image;
+            fetch('/api/frame.jpg?quality=' + encodeURIComponent(quality) + '&t=' + timestamp, {cache: 'no-store'})
+                .then(response => {
+                    const contentType = response.headers.get('content-type') || '';
+                    if (contentType.indexOf('application/json') !== -1) {
+                        return response.json().then(data => {
+                            throw new Error(data.hint || data.error || 'Screenshot failed');
+                        });
+                    }
+                    if (!response.ok) {
+                        return response.text().then(text => { throw new Error(text || response.statusText); });
+                    }
+                    return response.blob();
+                })
+                .then(blob => {
+                    const frameUrl = URL.createObjectURL(blob);
+                    screen.onload = () => {
+                        if (screen.naturalWidth && screen.naturalHeight) {
+                            screenAspect = screen.naturalWidth / screen.naturalHeight;
+                        }
+                        if (latestFrameUrl) URL.revokeObjectURL(latestFrameUrl);
+                        latestFrameUrl = frameUrl;
+                        screenFrame.style.display = 'block';
                         loading.style.display = 'none';
                         screen.style.display = 'block';
+                        syncScreenFrameSize();
+                        trackCursorPosition();
+                    };
+                    screen.src = frameUrl;
 
-                        if (screen.complete && screen.naturalWidth) {
-                            syncAfterLoad();
-                        }
+                    const latency = Math.round(performance.now() - started);
+                    latencyDisplay.textContent = latency + 'ms';
+                    adaptiveDelay = Math.max(parseInt(document.getElementById('refreshRate').value), latency + 20);
 
-                        frameCount++;
-                        const now = Date.now();
-                        if (now - lastFpsUpdate >= 1000) {
-                            fpsDisplay.textContent = frameCount;
-                            frameCount = 0;
-                            lastFpsUpdate = now;
-                        }
+                    frameCount++;
+                    const now = Date.now();
+                    if (now - lastFpsUpdate >= 1000) {
+                        fpsDisplay.textContent = frameCount;
+                        frameCount = 0;
+                        lastFpsUpdate = now;
                     }
                 })
                 .catch(err => {
                     console.error('Screenshot error:', err);
-                    loading.textContent = 'Error loading desktop. Retrying...';
+                    loading.style.display = 'block';
+                    loading.textContent = (err && err.message) ? err.message : 'Error loading desktop. Retrying...';
+                    adaptiveDelay = Math.max(500, adaptiveDelay * 1.5);
+                })
+                .finally(() => {
+                    refreshInFlight = false;
+                    scheduleNextRefresh();
                 });
         }
 
         function startAutoRefresh() {
+            streamMode = true;
+            startStream();
+        }
+
+        function startStream() {
+            if (refreshTimer) clearTimeout(refreshTimer);
+            const quality = document.getElementById('qualitySelect').value;
             const rate = parseInt(document.getElementById('refreshRate').value);
-            if (refreshInterval) clearInterval(refreshInterval);
-            refreshInterval = setInterval(refreshScreen, rate);
+            const fps = Math.max(1, Math.min(15, Math.round(1000 / rate)));
+            streamToken++;
+            screen.onload = () => {
+                if (screen.naturalWidth && screen.naturalHeight) {
+                    screenAspect = screen.naturalWidth / screen.naturalHeight;
+                }
+                screenFrame.style.display = 'block';
+                loading.style.display = 'none';
+                screen.style.display = 'block';
+                syncScreenFrameSize();
+                trackCursorPosition();
+                fpsDisplay.textContent = 'stream';
+                latencyDisplay.textContent = 'live';
+            };
+            screen.onerror = () => {
+                loading.style.display = 'block';
+                loading.textContent = 'Screen capture is blocked by macOS permission.';
+            };
+            screen.src = '/api/stream.mjpg?quality=' + encodeURIComponent(quality) + '&fps=' + fps + '&stream=' + streamToken;
+        }
+
+        function scheduleNextRefresh(delay) {
+            if (!document.getElementById('autoRefresh').checked) return;
+            if (refreshTimer) clearTimeout(refreshTimer);
+            const wait = delay == null ? adaptiveDelay : delay;
+            refreshTimer = setTimeout(refreshScreen, wait);
         }
 
         function startCursorTracking() {
@@ -1122,7 +1239,9 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
             if (e.target.checked) {
                 startAutoRefresh();
             } else {
-                if (refreshInterval) clearInterval(refreshInterval);
+                streamMode = false;
+                screen.removeAttribute('src');
+                if (refreshTimer) clearTimeout(refreshTimer);
             }
         });
 
@@ -1143,6 +1262,20 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
 
         document.getElementById('qualitySelect').addEventListener('change', (e) => {
             document.getElementById('quality').textContent = e.target.value.charAt(0).toUpperCase() + e.target.value.slice(1);
+            if (document.getElementById('autoRefresh').checked) {
+                startAutoRefresh();
+            } else {
+                refreshScreen();
+            }
+        });
+
+        document.getElementById('controlsToggle').addEventListener('click', () => {
+            const panel = document.getElementById('controlsPanel');
+            const collapsed = panel.classList.toggle('collapsed');
+            const toggle = document.getElementById('controlsToggle');
+            toggle.textContent = collapsed ? '+' : '_';
+            toggle.title = collapsed ? 'Show controls' : 'Minimize controls';
+            toggle.setAttribute('aria-label', toggle.title);
         });
 
         // Mouse and keyboard events
@@ -1172,7 +1305,15 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         document.addEventListener('fullscreenchange', scheduleScreenFrameSync);
         container.addEventListener('scroll', () => { if (lastNormX != null) trackCursorPosition(); });
 
-        refreshScreen();
+        fetch('/api/status', {cache: 'no-store'})
+            .then(response => response.json())
+            .then(data => {
+                const host = window.location.hostname;
+                const local = data.lan_addresses || [];
+                lanStatus.textContent = local.includes(host) || host === '127.0.0.1' || host === 'localhost' ? 'direct' : (local[0] || 'ready');
+            })
+            .catch(() => { lanStatus.textContent = 'ready'; });
+
         startAutoRefresh();
         startCursorTracking();
     </script>
@@ -1193,41 +1334,193 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def serve_screenshot(self):
-        screenshot_path = '/tmp/dwagent_screenshot.jpg'
-        try:
-            if sys.platform == 'darwin':
-                result = subprocess.run(
-                    ['screencapture', '-x', '-t', 'jpg', screenshot_path],
-                    capture_output=True, text=True, timeout=15
-                )
-                if result.returncode != 0:
-                    err = (result.stderr or result.stdout or 'screencapture failed').strip()
-                    self._send_json(200, {
-                        'error': err,
-                        'hint': 'Grant Screen Recording for Terminal/Python in System Settings',
+    def _quality_settings(self, requested):
+        requested = (requested or 'high').lower()
+        if requested == 'low':
+            return 'low', 45, 0.55
+        if requested == 'medium':
+            return 'medium', 65, 0.75
+        return 'high', 82, 1.0
+
+    def _capture_screenshot_bytes(self, quality_name):
+        quality_name, jpeg_quality, scale = self._quality_settings(quality_name)
+        now = time.time()
+        cached = self.screenshot_cache.get(quality_name)
+        if cached and now - cached.get('created', 0) < self.min_capture_interval:
+            return cached
+
+        with self.screenshot_lock:
+            now = time.time()
+            cached = self.screenshot_cache.get(quality_name)
+            if cached and now - cached.get('created', 0) < self.min_capture_interval:
+                return cached
+
+            wait = self.min_capture_interval - (now - self._last_capture_started)
+            if wait > 0:
+                time.sleep(wait)
+            self.__class__._last_capture_started = time.time()
+
+            src_path = None
+            out_path = None
+            try:
+                src_fd, src_path = tempfile.mkstemp(prefix='dwagent_screen_', suffix='.jpg')
+                os.close(src_fd)
+
+                if sys.platform == 'darwin':
+                    result = subprocess.run(
+                        ['screencapture', '-x', '-t', 'jpg', src_path],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if result.returncode != 0:
+                        err = (result.stderr or result.stdout or 'screencapture failed').strip()
+                        return {
+                            'error': err,
+                            'hint': 'Grant Screen Recording for Terminal/Python in System Settings',
+                            'timestamp': time.time(),
+                            **self.capture_bounds.as_dict(),
+                        }
+                else:
+                    return {'error': 'Screenshots supported on macOS only', 'timestamp': time.time()}
+
+                self.capture_bounds.update_from_screenshot(src_path)
+                output_path = src_path
+
+                if scale < 1.0 or jpeg_quality < 82:
+                    pixel_w, pixel_h = get_image_pixel_size(src_path)
+                    if pixel_w and pixel_h:
+                        out_fd, out_path = tempfile.mkstemp(prefix='dwagent_screen_opt_', suffix='.jpg')
+                        os.close(out_fd)
+                        max_dim = max(320, int(max(pixel_w, pixel_h) * scale))
+                        sips_cmd = [
+                            'sips',
+                            '-s', 'format', 'jpeg',
+                            '-s', 'formatOptions', str(jpeg_quality),
+                            '-Z', str(max_dim),
+                            src_path,
+                            '--out', out_path,
+                        ]
+                        sips = subprocess.run(sips_cmd, capture_output=True, text=True, timeout=5)
+                        if sips.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            output_path = out_path
+                            self.capture_bounds.update_from_screenshot(output_path)
+
+                with open(output_path, 'rb') as f:
+                    img_data = f.read()
+                if not img_data:
+                    return {
+                        'error': 'empty screenshot',
                         'timestamp': time.time(),
                         **self.capture_bounds.as_dict(),
-                    })
-                    return
-            else:
-                self._send_json(501, {'error': 'Screenshots supported on macOS only'})
+                    }
+
+                payload = {
+                    'bytes': img_data,
+                    'quality': quality_name,
+                    'timestamp': time.time(),
+                    'created': time.time(),
+                    'byte_length': len(img_data),
+                    **self.capture_bounds.as_dict(),
+                }
+                self.screenshot_cache[quality_name] = payload
+                return payload
+            finally:
+                for path in (src_path, out_path):
+                    try:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
+
+    def serve_screenshot_jpeg(self):
+        params = parse_qs(urlparse(self.path).query)
+        quality = params.get('quality', ['high'])[0]
+        try:
+            frame = self._capture_screenshot_bytes(quality)
+            if frame.get('error'):
+                self._send_json(503, frame)
                 return
 
-            self.capture_bounds.update_from_screenshot(screenshot_path)
-            with open(screenshot_path, 'rb') as f:
-                img_data = f.read()
-            if not img_data:
-                self._send_json(200, {
-                    'error': 'empty screenshot',
-                    'timestamp': time.time(),
-                    **self.capture_bounds.as_dict(),
-                })
+            body = frame['bytes']
+            self.send_response(200)
+            self.send_header('Content-type', 'image/jpeg')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('X-Capture-Width', str(frame.get('capture_width', 0)))
+            self.send_header('X-Capture-Height', str(frame.get('capture_height', 0)))
+            self.send_header('X-Frame-Timestamp', str(frame.get('timestamp', time.time())))
+            self.send_header('X-Quality', frame.get('quality', 'high'))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            _log('jpeg frame error: {}'.format(e))
+            self._send_json(500, {'error': str(e), 'timestamp': time.time()})
+
+    def serve_mjpeg_stream(self):
+        params = parse_qs(urlparse(self.path).query)
+        quality = params.get('quality', ['high'])[0]
+        try:
+            fps = int(params.get('fps', ['10'])[0])
+        except (TypeError, ValueError):
+            fps = 10
+        fps = max(1, min(15, fps))
+        frame_delay = 1.0 / fps
+        boundary = 'dwagentframe'
+
+        try:
+            first_frame = self._capture_screenshot_bytes(quality)
+            if first_frame.get('error'):
+                self._send_json(503, first_frame)
+                return
+
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary={}'.format(boundary))
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.end_headers()
+
+            frame = first_frame
+            while True:
+                started = time.time()
+                if not frame.get('error'):
+                    body = frame['bytes']
+                    self.wfile.write(('--{}\r\n'.format(boundary)).encode())
+                    self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                    self.wfile.write(('Content-Length: {}\r\n'.format(len(body))).encode())
+                    self.wfile.write(('X-Capture-Width: {}\r\n'.format(frame.get('capture_width', 0))).encode())
+                    self.wfile.write(('X-Capture-Height: {}\r\n'.format(frame.get('capture_height', 0))).encode())
+                    self.wfile.write(b'\r\n')
+                    self.wfile.write(body)
+                    self.wfile.write(b'\r\n')
+                    self.wfile.flush()
+
+                elapsed = time.time() - started
+                if elapsed < frame_delay:
+                    time.sleep(frame_delay - elapsed)
+                frame = self._capture_screenshot_bytes(quality)
+                if frame.get('error'):
+                    _log('mjpeg stream capture error: {}'.format(frame.get('error')))
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            _log('mjpeg stream error: {}'.format(e))
+
+    def serve_screenshot(self):
+        params = parse_qs(urlparse(self.path).query)
+        quality = params.get('quality', ['high'])[0]
+        try:
+            frame = self._capture_screenshot_bytes(quality)
+            if frame.get('error'):
+                self._send_json(200, frame)
                 return
 
             self._send_json(200, {
-                'image': base64.b64encode(img_data).decode('utf-8'),
-                'timestamp': time.time(),
+                'image': base64.b64encode(frame['bytes']).decode('utf-8'),
+                'quality': frame.get('quality', 'high'),
+                'timestamp': frame.get('timestamp', time.time()),
+                'byte_length': frame.get('byte_length'),
                 **self.capture_bounds.as_dict(),
             })
         except Exception as e:
@@ -1237,12 +1530,6 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
                 'timestamp': time.time(),
                 **self.capture_bounds.as_dict(),
             })
-        finally:
-            try:
-                if os.path.exists(screenshot_path):
-                    os.remove(screenshot_path)
-            except OSError:
-                pass
 
     def handle_mouse(self):
         """Best-in-class macOS mouse input with high-precision coordinate mapping."""
@@ -1415,6 +1702,7 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
+        lan_addresses = get_lan_addresses()
         status = {
             "running": True,
             "desktop_available": True,
@@ -1422,6 +1710,8 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
             "stealth": STEALTH_MODE,
             "port": PORT,
             "os": sys.platform,
+            "lan_addresses": lan_addresses,
+            "lan_urls": ['http://{}:{}/desktop'.format(ip, PORT) for ip in lan_addresses],
         }
         self.wfile.write(json.dumps(status).encode())
 
@@ -1443,6 +1733,7 @@ class DesktopHandler(http.server.SimpleHTTPRequestHandler):
             'bounds': bounds,
             'stealth': STEALTH_MODE,
             'port': PORT,
+            'lan_addresses': get_lan_addresses(),
         }).encode())
 
     def log_message(self, format, *args):
@@ -1475,17 +1766,8 @@ def run_server():
     _log('Desktop server listening on 0.0.0.0:{} stealth={}'.format(PORT, STEALTH_MODE))
 
     if not STEALTH_MODE:
-        ip_hint = '127.0.0.1'
-        try:
-            r = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=2)
-            for line in r.stdout.splitlines():
-                if 'inet ' in line and '127.0.0.1' not in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        ip_hint = parts[1]
-                        break
-        except Exception:
-            pass
+        lan_addresses = get_lan_addresses()
+        ip_hint = lan_addresses[0] if lan_addresses else '127.0.0.1'
         print('=' * 60)
         print('Remote desktop server')
         print('  http://127.0.0.1:{}/desktop'.format(PORT))
