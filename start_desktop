@@ -1,0 +1,4 @@
+#!/bin/bash
+# Wrapper so ./start_desktop works (no .sh extension).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/start_desktop.sh" "$@"
